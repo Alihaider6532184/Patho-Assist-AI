@@ -2,18 +2,22 @@
 =============================================================================
  Patho-Assist AI — Vision Engine (vision_engine.py)
 =============================================================================
- Handles histopathology image analysis via Ollama's paligemma model.
+ Handles histopathology image analysis via either:
+   • LOCAL mode  → Ollama (llava) running on the host machine
+   • CLOUD mode  → Meta Llama API (Llama 4 Maverick) via official SDK
 
- Memory-Safe Execution Flow (16 GB RAM constraint):
+ Memory-Safe Execution Flow (LOCAL — 16 GB RAM constraint):
    1. Ensure NO other Ollama model is loaded (defensive eviction)
    2. Read the image file as raw bytes
    3. Call ollama.generate() with the image bytes in the `images` param
    4. Collect the full text description
-   5. Immediately evict paligemma (keep_alive=0) → 0 bytes GPU/RAM
+   5. Immediately evict the model (keep_alive=0) → 0 bytes GPU/RAM
 
- Uses the official `ollama` Python SDK (AsyncClient) instead of raw
- httpx calls. The SDK handles endpoint routing, serialisation, and
- error handling internally — eliminating 404 issues with manual URLs.
+ Cloud Execution Flow (CLOUD — Llama API):
+   1. Read the image file and base64-encode it
+   2. Call AsyncLlamaAPIClient.chat.completions.create() with inline
+      base64 image data URI + medical prompt
+   3. Return the generated description (no eviction needed — stateless API)
 
  Public API:
    VisionEngine.analyze_image(image_path) → str
@@ -24,8 +28,9 @@ import base64
 import asyncio
 import logging
 from pathlib import Path
+from typing import Optional
 
-from ollama import AsyncClient
+from ollama import AsyncClient as OllamaAsyncClient
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -53,40 +58,69 @@ VISION_PROMPT = (
 
 class VisionEngine:
     """
-    Manages the paligemma vision model lifecycle via the official Ollama SDK.
+    Manages the vision model lifecycle — dual-mode (local Ollama / cloud Llama API).
 
-    The 16 GB RAM constraint means only ONE model can be loaded at a time.
-    This engine ensures paligemma is:
-      loaded → used → IMMEDIATELY evicted (keep_alive=0)
+    LOCAL mode (16 GB RAM constraint):
+      The engine ensures the vision model is:
+        loaded → used → IMMEDIATELY evicted (keep_alive=0)
+
+    CLOUD mode:
+      Uses Meta's hosted Llama 4 Maverick (multimodal) via the official SDK.
+      No local GPU/RAM required. Stateless API — no eviction needed.
 
     Usage:
-        engine = VisionEngine(ollama_base_url="http://localhost:11434")
+        engine = VisionEngine(run_mode="cloud", api_key="...", cloud_model_name="...")
         description = await engine.analyze_image("/path/to/slide.png")
-        # At this point, paligemma is already evicted from RAM.
     """
 
     def __init__(
         self,
         ollama_base_url: str = "http://localhost:11434",
-        model_name: str = "paligemma",
+        model_name: str = "llava",
+        run_mode: str = "local",
+        api_key: Optional[str] = None,
+        cloud_model_name: Optional[str] = None,
     ):
         """
         Args:
-            ollama_base_url: URL of the local Ollama server.
-            model_name:      Model tag as shown by `ollama list`.
+            ollama_base_url:   URL of the local Ollama server (local mode).
+            model_name:        Ollama model tag as shown by `ollama list`.
+            run_mode:          "local" (Ollama) or "cloud" (Llama API).
+            api_key:           Llama API key (cloud mode only).
+            cloud_model_name:  Cloud model identifier (e.g. "Llama-4-Maverick-17B-128E-Instruct-FP8").
         """
+        self.run_mode = run_mode.lower()
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.model_name = model_name
-        # Create the async client pointing at our local Ollama instance
-        self.client = AsyncClient(host=self.ollama_base_url)
-        logger.info("VisionEngine initialised (model: %s, url: %s)", model_name, self.ollama_base_url)
+        self.cloud_model_name = cloud_model_name
+        self.api_key = api_key
+
+        # Initialise the appropriate client
+        if self.run_mode == "cloud":
+            if not api_key:
+                raise ValueError("LLAMA_API_KEY is required for cloud mode.")
+            # Lazy import to avoid dependency issues when running in local-only mode
+            from llama_api_client import AsyncLlamaAPIClient
+            self.llama_client = AsyncLlamaAPIClient(api_key=api_key)
+            self.ollama_client = None
+            logger.info(
+                "VisionEngine initialised (mode: CLOUD, model: %s)",
+                cloud_model_name,
+            )
+        else:
+            self.ollama_client = OllamaAsyncClient(host=self.ollama_base_url)
+            self.llama_client = None
+            logger.info(
+                "VisionEngine initialised (mode: LOCAL, model: %s, url: %s)",
+                model_name, self.ollama_base_url,
+            )
 
     # -----------------------------------------------------------------------
     # Public: Analyze Image
     # -----------------------------------------------------------------------
     async def analyze_image(self, image_path: str) -> str:
         """
-        Full vision pipeline: encode → infer → evict.
+        Full vision pipeline — delegates to local or cloud based on run_mode.
 
         Args:
             image_path: Absolute path to the histopathology image file.
@@ -102,8 +136,99 @@ class VisionEngine:
         if not image_path.exists():
             raise FileNotFoundError(f"Image not found: {image_path}")
 
-        logger.info("▶ Vision analysis starting: %s", image_path.name)
+        logger.info("▶ Vision analysis starting: %s (mode: %s)", image_path.name, self.run_mode.upper())
 
+        if self.run_mode == "cloud":
+            return await self._analyze_cloud(image_path)
+        else:
+            return await self._analyze_local(image_path)
+
+    # -----------------------------------------------------------------------
+    # CLOUD: Llama API Inference
+    # -----------------------------------------------------------------------
+    async def _analyze_cloud(self, image_path: Path) -> str:
+        """
+        Analyze the image using the Llama API (cloud mode).
+
+        Sends the image as a base64 data URI in a multimodal
+        chat completions request. Llama 4 Maverick natively supports
+        vision input via the standard content blocks format.
+        """
+        # Read and base64-encode the image
+        image_bytes = image_path.read_bytes()
+        b64_image = base64.b64encode(image_bytes).decode("utf-8")
+
+        # Determine MIME type from extension
+        ext = image_path.suffix.lower()
+        mime_map = {
+            ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".tiff": "image/tiff", ".bmp": "image/bmp", ".webp": "image/webp",
+        }
+        mime_type = mime_map.get(ext, "image/jpeg")
+
+        logger.info(
+            "Sending image to Llama API (%s) — cloud inference …",
+            self.cloud_model_name,
+        )
+
+        try:
+            response = await self.llama_client.chat.completions.create(
+                model=self.cloud_model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": VISION_PROMPT},
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:{mime_type};base64,{b64_image}"
+                                },
+                            },
+                        ],
+                    }
+                ],
+                temperature=0.3,
+            )
+        except Exception as exc:
+            logger.exception("Llama API vision call failed for model '%s'", self.cloud_model_name)
+            raise RuntimeError(
+                f"Vision inference failed (cloud): {exc}. "
+                "Check your LLAMA_API_KEY and network connection."
+            ) from exc
+
+        # Extract the response text
+        full_response = ""
+        if hasattr(response, "completion_message") and response.completion_message:
+            content = response.completion_message.content
+            if isinstance(content, str):
+                full_response = content.strip()
+            elif isinstance(content, list):
+                # Content may be a list of content blocks
+                full_response = " ".join(
+                    block.text for block in content
+                    if hasattr(block, "text")
+                ).strip()
+            elif hasattr(content, "text"):
+                full_response = content.text.strip()
+
+        if not full_response:
+            raise RuntimeError(
+                f"Llama API returned an empty response for model '{self.cloud_model_name}'."
+            )
+
+        logger.info("✓ Cloud vision analysis complete (%d chars)", len(full_response))
+        return full_response
+
+    # -----------------------------------------------------------------------
+    # LOCAL: Ollama Inference (unchanged from original)
+    # -----------------------------------------------------------------------
+    async def _analyze_local(self, image_path: Path) -> str:
+        """
+        Analyze the image using Ollama (local mode).
+
+        Full pipeline: evict → read image → infer → evict.
+        """
         # Step 1: Defensively evict any lingering model from RAM
         await self._evict_all_models()
 
@@ -112,29 +237,17 @@ class VisionEngine:
         logger.info("Image read (%d bytes)", len(image_bytes))
 
         # Step 3: Run inference with keep_alive=0 (auto-evict after response)
-        description = await self._run_inference(image_bytes)
+        description = await self._run_local_inference(image_bytes)
 
         # Step 4: Belt-and-suspenders — explicitly confirm eviction
         await self._evict_model(self.model_name)
 
-        logger.info("✓ Vision analysis complete (%d chars). Model evicted.", len(description))
+        logger.info("✓ Local vision analysis complete (%d chars). Model evicted.", len(description))
         return description
 
-    # -----------------------------------------------------------------------
-    # Private: Ollama Inference via Official SDK
-    # -----------------------------------------------------------------------
-    async def _run_inference(self, image_bytes: bytes) -> str:
+    async def _run_local_inference(self, image_bytes: bytes) -> str:
         """
         Send the image + medical prompt to Ollama using the official SDK.
-
-        Uses `client.generate()` (NOT `client.chat()`) because paligemma
-        only supports the generate endpoint. The SDK handles the correct
-        endpoint routing and payload serialisation internally.
-
-        The `images` parameter accepts a list of raw bytes or base64 strings.
-        The `keep_alive` parameter is set to 0 to evict the model immediately
-        after generation completes — this is the cornerstone of our 16 GB
-        memory-swap strategy.
         """
         logger.info(
             "Sending image to Ollama (%s) via SDK generate() — this may take a while …",
@@ -142,15 +255,15 @@ class VisionEngine:
         )
 
         try:
-            response = await self.client.generate(
+            response = await self.ollama_client.generate(
                 model=self.model_name,
                 prompt=VISION_PROMPT,
-                images=[image_bytes],       # SDK accepts raw bytes directly
-                stream=False,               # Get the full response at once
-                keep_alive=0,               # ⚠️ CRITICAL: Evict immediately after
+                images=[image_bytes],
+                stream=False,
+                keep_alive=0,
                 options={
-                    "temperature": 0.3,     # Low temp for factual medical analysis
-                    "num_predict": 1024,    # Max tokens for the description
+                    "temperature": 0.3,
+                    "num_predict": 1024,
                 },
             )
         except Exception as exc:
@@ -161,10 +274,8 @@ class VisionEngine:
                 f"(`ollama pull {self.model_name}`)."
             ) from exc
 
-        # The SDK returns a GenerateResponse object with attributes
         full_response = (response.response or "").strip()
 
-        # Log generation stats if available
         total_duration = getattr(response, "total_duration", 0) or 0
         eval_count = getattr(response, "eval_count", 0) or 0
         if total_duration:
@@ -177,43 +288,35 @@ class VisionEngine:
         if not full_response:
             raise RuntimeError(
                 f"Ollama returned an empty response for model '{self.model_name}'. "
-                "Ensure the model is pulled (`ollama pull paligemma`) and supports vision."
+                f"Ensure the model is pulled (`ollama pull {self.model_name}`) and supports vision."
             )
 
         return full_response
 
     # -----------------------------------------------------------------------
-    # Private: Model Memory Management (using SDK)
+    # Private: Model Memory Management (LOCAL mode only)
     # -----------------------------------------------------------------------
     async def _evict_model(self, model_name: str) -> None:
-        """
-        Force-evict a specific model from Ollama's memory.
-
-        Sends a generate request with keep_alive=0 and an empty prompt
-        to trigger immediate unloading without producing output.
-        Uses the official SDK for reliability.
-        """
+        """Force-evict a specific model from Ollama's memory."""
+        if self.run_mode == "cloud":
+            return  # No eviction needed for cloud mode
         try:
-            await self.client.generate(
+            await self.ollama_client.generate(
                 model=model_name,
                 prompt="",
-                keep_alive=0,       # ← Evict NOW
+                keep_alive=0,
                 stream=False,
             )
             logger.info("Model '%s' evicted from RAM ✓", model_name)
         except Exception as exc:
-            # Non-fatal — model may not have been loaded
             logger.debug("Eviction request for '%s' failed: %s (non-fatal)", model_name, exc)
 
     async def _evict_all_models(self) -> None:
-        """
-        Defensively evict ALL known models before loading a new one.
-
-        Queries Ollama's running model list via the SDK, then evicts
-        each one. This guarantees a clean RAM slate.
-        """
+        """Defensively evict ALL running models before loading a new one."""
+        if self.run_mode == "cloud":
+            return  # No eviction needed for cloud mode
         try:
-            ps_response = await self.client.ps()
+            ps_response = await self.ollama_client.ps()
             running_models = ps_response.models or []
 
             if not running_models:
@@ -229,7 +332,6 @@ class VisionEngine:
                 )
                 await self._evict_model(name)
 
-            # Brief pause to let Ollama fully release memory
             await asyncio.sleep(1.0)
             logger.info("All models evicted — RAM available for next task")
 
@@ -241,26 +343,39 @@ class VisionEngine:
     # -----------------------------------------------------------------------
     async def is_model_available(self) -> bool:
         """
-        Check if the vision model is pulled/available in Ollama.
-        Does NOT load the model — just checks the model registry.
-        Uses the official SDK `list()` method.
+        Check if the vision model is available.
+        - LOCAL: checks Ollama's model registry.
+        - CLOUD: verifies API key is set and makes a lightweight models.list() call.
         """
-        try:
-            response = await self.client.list()
-            models = response.models or []
-            model_names = [m.model for m in models if m.model]
-            available = any(self.model_name in name for name in model_names)
+        if self.run_mode == "cloud":
+            if not self.api_key:
+                logger.warning("Cloud mode but no LLAMA_API_KEY set")
+                return False
+            try:
+                # Lightweight check — list available models
+                models_response = await self.llama_client.models.list()
+                logger.info("Llama API connected ✓ (vision model: %s)", self.cloud_model_name)
+                return True
+            except Exception as exc:
+                logger.error("Cannot reach Llama API: %s", exc)
+                return False
+        else:
+            try:
+                response = await self.ollama_client.list()
+                models = response.models or []
+                model_names = [m.model for m in models if m.model]
+                available = any(self.model_name in name for name in model_names)
 
-            if available:
-                logger.info("Vision model '%s' is available in Ollama ✓", self.model_name)
-            else:
-                logger.warning(
-                    "Vision model '%s' NOT found. Available: %s",
-                    self.model_name,
-                    model_names,
-                )
-            return available
+                if available:
+                    logger.info("Vision model '%s' is available in Ollama ✓", self.model_name)
+                else:
+                    logger.warning(
+                        "Vision model '%s' NOT found. Available: %s",
+                        self.model_name,
+                        model_names,
+                    )
+                return available
 
-        except Exception as exc:
-            logger.error("Cannot reach Ollama at %s: %s", self.ollama_base_url, exc)
-            return False
+            except Exception as exc:
+                logger.error("Cannot reach Ollama at %s: %s", self.ollama_base_url, exc)
+                return False

@@ -2,21 +2,27 @@
 =============================================================================
  Patho-Assist AI — Chat Engine (chat_engine.py)
 =============================================================================
- Handles cross-modal chat using Ollama's text/reasoning model (gemma2:2b).
+ Handles cross-modal chat using either:
+   • LOCAL mode  → Ollama (gemma2:2b) running on the host machine
+   • CLOUD mode  → Meta Llama API (Llama 3.3 70B) via official SDK
 
- Memory-Safe Execution Flow (16 GB RAM constraint):
+ Memory-Safe Execution Flow (LOCAL — 16 GB RAM constraint):
    1. Ensure NO other Ollama model is loaded (defensive eviction)
    2. Build a rich prompt combining:
       a) Retrieved PDF chunks from ChromaDB (RAG context)
-      b) Vision description from paligemma (if available in session)
+      b) Vision description from the vision model (if available)
       c) The user's natural-language question
       d) Recent chat history for conversational continuity
    3. Call ollama.generate() with the combined prompt
    4. Collect the response (non-streaming for reliability)
-   5. Immediately evict gemma2:2b (keep_alive=0) → 0 bytes GPU/RAM
+   5. Immediately evict the model (keep_alive=0) → 0 bytes GPU/RAM
 
- Uses the official `ollama` Python SDK (AsyncClient) instead of raw
- httpx calls — matching vision_engine.py for full consistency.
+ Cloud Execution Flow (CLOUD — Llama API):
+   1. Build a structured messages array (system + user content)
+   2. Call AsyncLlamaAPIClient.chat.completions.create() with messages
+   3. Return the generated answer (no eviction needed — stateless API)
+
+ Uses the official `ollama` Python SDK (LOCAL) or `llama-api-client` (CLOUD).
 
  Public API:
    ChatEngine.generate_answer(question, rag_context, image_description, chat_history) → str
@@ -26,7 +32,7 @@ import asyncio
 import logging
 from typing import List, Dict, Optional
 
-from ollama import AsyncClient
+from ollama import AsyncClient as OllamaAsyncClient
 
 # ---------------------------------------------------------------------------
 # Logger
@@ -36,8 +42,7 @@ logger = logging.getLogger("patho-assist.chat")
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-# Timeout for text generation — gemma2:2b is smaller and faster than paligemma,
-# but we still allow generous time for complex multi-context queries.
+# Timeout for text generation (local mode)
 INFERENCE_TIMEOUT = 180.0  # seconds
 
 # ---------------------------------------------------------------------------
@@ -65,37 +70,61 @@ IMPORTANT RULES:
 
 class ChatEngine:
     """
-    Manages the text/reasoning model lifecycle via the official Ollama SDK.
+    Manages the text/reasoning model lifecycle — dual-mode (local Ollama / cloud Llama API).
 
-    The 16 GB RAM constraint means only ONE model can be loaded at a time.
-    This engine ensures gemma2:2b is:
-      loaded → used → IMMEDIATELY evicted (keep_alive=0)
+    LOCAL mode (16 GB RAM constraint):
+      The engine ensures the text model is:
+        loaded → used → IMMEDIATELY evicted (keep_alive=0)
+
+    CLOUD mode:
+      Uses Meta's hosted Llama 3.3 70B Instruct via the official SDK.
+      No local GPU/RAM required. Stateless API — no eviction needed.
 
     Usage:
-        engine = ChatEngine(ollama_base_url="http://localhost:11434")
-        answer = await engine.generate_answer(
-            question="What is the tumour grade?",
-            rag_context=[{"text": "...", "page": 3}],
-            image_description="Tissue shows ...",
-            chat_history=[{"question": "...", "answer": "..."}],
-        )
-        # At this point, gemma2:2b is already evicted from RAM.
+        engine = ChatEngine(run_mode="cloud", api_key="...", cloud_model_name="...")
+        answer = await engine.generate_answer(question="...", rag_context=[...])
     """
 
     def __init__(
         self,
         ollama_base_url: str = "http://localhost:11434",
         model_name: str = "gemma2:2b",
+        run_mode: str = "local",
+        api_key: Optional[str] = None,
+        cloud_model_name: Optional[str] = None,
     ):
         """
         Args:
-            ollama_base_url: URL of the local Ollama server.
-            model_name:      Model tag as shown by `ollama list`.
+            ollama_base_url:   URL of the local Ollama server (local mode).
+            model_name:        Ollama model tag as shown by `ollama list`.
+            run_mode:          "local" (Ollama) or "cloud" (Llama API).
+            api_key:           Llama API key (cloud mode only).
+            cloud_model_name:  Cloud model identifier (e.g. "Llama-3.3-70B-Instruct").
         """
+        self.run_mode = run_mode.lower()
         self.ollama_base_url = ollama_base_url.rstrip("/")
         self.model_name = model_name
-        self.client = AsyncClient(host=self.ollama_base_url)
-        logger.info("ChatEngine initialised (model: %s, url: %s)", model_name, self.ollama_base_url)
+        self.cloud_model_name = cloud_model_name
+        self.api_key = api_key
+
+        # Initialise the appropriate client
+        if self.run_mode == "cloud":
+            if not api_key:
+                raise ValueError("LLAMA_API_KEY is required for cloud mode.")
+            from llama_api_client import AsyncLlamaAPIClient
+            self.llama_client = AsyncLlamaAPIClient(api_key=api_key)
+            self.ollama_client = None
+            logger.info(
+                "ChatEngine initialised (mode: CLOUD, model: %s)",
+                cloud_model_name,
+            )
+        else:
+            self.ollama_client = OllamaAsyncClient(host=self.ollama_base_url)
+            self.llama_client = None
+            logger.info(
+                "ChatEngine initialised (mode: LOCAL, model: %s, url: %s)",
+                model_name, self.ollama_base_url,
+            )
 
     # -----------------------------------------------------------------------
     # Public: Generate Answer
@@ -108,25 +137,112 @@ class ChatEngine:
         chat_history: Optional[List[Dict]] = None,
     ) -> str:
         """
-        Full chat pipeline: build prompt → infer → evict.
+        Full chat pipeline — delegates to local or cloud based on run_mode.
 
         Args:
             question:          The user's natural-language question.
             rag_context:       Retrieved PDF chunks from ChromaDB.
-                               Each dict has: text, page, distance, chunk_index.
-            image_description: paligemma's analysis of the histopathology image
-                               (None if no image was uploaded in this session).
-            chat_history:      Previous Q&A turns in this session (for continuity).
+            image_description: Vision model's image analysis (None if no image).
+            chat_history:      Previous Q&A turns in this session.
 
         Returns:
             The model's answer as a string.
-
-        Raises:
-            httpx.HTTPStatusError: If Ollama returns a non-2xx status.
-            RuntimeError: If the model fails to generate a response.
         """
-        logger.info("▶ Chat generation starting — question: '%s'", question[:80])
+        logger.info("▶ Chat generation starting — question: '%s' (mode: %s)",
+                     question[:80], self.run_mode.upper())
 
+        if self.run_mode == "cloud":
+            return await self._generate_cloud(
+                question, rag_context, image_description, chat_history or []
+            )
+        else:
+            return await self._generate_local(
+                question, rag_context, image_description, chat_history or []
+            )
+
+    # -----------------------------------------------------------------------
+    # CLOUD: Llama API Inference
+    # -----------------------------------------------------------------------
+    async def _generate_cloud(
+        self,
+        question: str,
+        rag_context: List[Dict],
+        image_description: Optional[str],
+        chat_history: List[Dict],
+    ) -> str:
+        """
+        Generate an answer using the Llama API (cloud mode).
+
+        Builds a structured messages array with system prompt + user context,
+        then calls the Llama API chat completions endpoint.
+        """
+        # Build the user content combining all context
+        user_content = self._build_prompt(
+            question=question,
+            rag_context=rag_context,
+            image_description=image_description,
+            chat_history=chat_history,
+        )
+
+        logger.info(
+            "Sending prompt to Llama API (%s) — cloud inference …",
+            self.cloud_model_name,
+        )
+
+        try:
+            response = await self.llama_client.chat.completions.create(
+                model=self.cloud_model_name,
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0.5,
+                top_p=0.9,
+            )
+        except Exception as exc:
+            logger.exception("Llama API chat call failed for model '%s'", self.cloud_model_name)
+            raise RuntimeError(
+                f"Chat inference failed (cloud): {exc}. "
+                "Check your LLAMA_API_KEY and network connection."
+            ) from exc
+
+        # Extract the response text
+        full_response = ""
+        if hasattr(response, "completion_message") and response.completion_message:
+            content = response.completion_message.content
+            if isinstance(content, str):
+                full_response = content.strip()
+            elif isinstance(content, list):
+                full_response = " ".join(
+                    block.text for block in content
+                    if hasattr(block, "text")
+                ).strip()
+            elif hasattr(content, "text"):
+                full_response = content.text.strip()
+
+        if not full_response:
+            raise RuntimeError(
+                f"Llama API returned an empty response for model '{self.cloud_model_name}'."
+            )
+
+        logger.info("✓ Cloud chat generation complete (%d chars)", len(full_response))
+        return full_response
+
+    # -----------------------------------------------------------------------
+    # LOCAL: Ollama Inference (unchanged from original)
+    # -----------------------------------------------------------------------
+    async def _generate_local(
+        self,
+        question: str,
+        rag_context: List[Dict],
+        image_description: Optional[str],
+        chat_history: List[Dict],
+    ) -> str:
+        """
+        Generate an answer using Ollama (local mode).
+
+        Full pipeline: evict → build prompt → infer → evict.
+        """
         # Step 1: Defensively evict any lingering model from RAM
         await self._evict_all_models()
 
@@ -135,22 +251,22 @@ class ChatEngine:
             question=question,
             rag_context=rag_context,
             image_description=image_description,
-            chat_history=chat_history or [],
+            chat_history=chat_history,
         )
         logger.info("Prompt built (%d chars, %d RAG chunks, image=%s)",
                      len(prompt), len(rag_context), image_description is not None)
 
         # Step 3: Run inference with keep_alive=0 (auto-evict after response)
-        answer = await self._run_inference(prompt)
+        answer = await self._run_local_inference(prompt)
 
         # Step 4: Belt-and-suspenders — explicitly confirm eviction
         await self._evict_model(self.model_name)
 
-        logger.info("✓ Chat generation complete (%d chars). Model evicted.", len(answer))
+        logger.info("✓ Local chat generation complete (%d chars). Model evicted.", len(answer))
         return answer
 
     # -----------------------------------------------------------------------
-    # Private: Prompt Construction
+    # Private: Prompt Construction (shared by both modes)
     # -----------------------------------------------------------------------
     def _build_prompt(
         self,
@@ -163,19 +279,12 @@ class ChatEngine:
         Assemble a structured prompt that combines all available context.
 
         The prompt follows a clear hierarchy:
-          1. System instructions (persona + rules)
-          2. PDF context (RAG retrieval results)
-          3. Image analysis context (if available)
-          4. Recent chat history (for conversational continuity)
-          5. The user's current question
-
-        This structure ensures the model has maximum relevant context
-        while respecting token limits for the smaller gemma2:2b model.
+          1. PDF context (RAG retrieval results)
+          2. Image analysis context (if available)
+          3. Recent chat history (for conversational continuity)
+          4. The user's current question
         """
         sections: list[str] = []
-
-        # --- System Instructions ---
-        sections.append(SYSTEM_PROMPT)
 
         # --- PDF / Document Context ---
         if rag_context:
@@ -211,7 +320,7 @@ class ChatEngine:
 
         # --- Chat History (last 3 turns for context window efficiency) ---
         if chat_history:
-            recent = chat_history[-3:]  # Only last 3 turns to save tokens
+            recent = chat_history[-3:]
             sections.append("-" * 50)
             sections.append("RECENT CONVERSATION HISTORY")
             sections.append("-" * 50)
@@ -235,21 +344,12 @@ class ChatEngine:
         return "\n".join(sections)
 
     # -----------------------------------------------------------------------
-    # Private: Ollama Inference via Official SDK
+    # Private: Ollama Inference (LOCAL mode)
     # -----------------------------------------------------------------------
-    async def _run_inference(self, prompt: str) -> str:
+    async def _run_local_inference(self, prompt: str) -> str:
         """
         Send the combined prompt to Ollama's text model via the official SDK.
-
-        Uses `client.generate()` with non-streaming mode.
-        The system prompt is prepended to the user prompt since generate()
-        does not natively support a system role — this is the cleanest
-        approach for text-only models like gemma2:2b.
-
-        The `keep_alive=0` parameter evicts the model from RAM the
-        instant generation completes.
         """
-        # Combine system prompt with user prompt for generate() endpoint
         full_prompt = f"{SYSTEM_PROMPT}\n\n{prompt}"
 
         logger.info(
@@ -258,18 +358,16 @@ class ChatEngine:
         )
 
         try:
-            response = await self.client.generate(
+            response = await self.ollama_client.generate(
                 model=self.model_name,
                 prompt=full_prompt,
                 stream=False,
-                # ⚠️ CRITICAL: Evict the model from RAM as soon as generation ends.
-                # This is the cornerstone of our 16 GB memory-swap strategy.
                 keep_alive=0,
                 options={
-                    "temperature": 0.5,        # Balanced creativity vs. factual accuracy
-                    "num_predict": 2048,       # Generous token budget for detailed answers
-                    "top_p": 0.9,              # Nucleus sampling for quality
-                    "repeat_penalty": 1.1,     # Discourage repetitive output
+                    "temperature": 0.5,
+                    "num_predict": 2048,
+                    "top_p": 0.9,
+                    "repeat_penalty": 1.1,
                 },
             )
         except Exception as exc:
@@ -280,10 +378,8 @@ class ChatEngine:
                 f"(`ollama pull {self.model_name}`)."
             ) from exc
 
-        # The SDK returns a GenerateResponse object with attributes
         full_response = (response.response or "").strip()
 
-        # Log generation stats if available
         total_duration = getattr(response, "total_duration", 0) or 0
         eval_count = getattr(response, "eval_count", 0) or 0
         if total_duration:
@@ -302,37 +398,29 @@ class ChatEngine:
         return full_response
 
     # -----------------------------------------------------------------------
-    # Private: Model Memory Management (using SDK)
+    # Private: Model Memory Management (LOCAL mode only)
     # -----------------------------------------------------------------------
     async def _evict_model(self, model_name: str) -> None:
-        """
-        Force-evict a specific model from Ollama's memory.
-
-        Sends a generate request with keep_alive=0 and an empty prompt
-        to trigger immediate unloading without producing output.
-        Uses the official SDK for reliability.
-        """
+        """Force-evict a specific model from Ollama's memory."""
+        if self.run_mode == "cloud":
+            return
         try:
-            await self.client.generate(
+            await self.ollama_client.generate(
                 model=model_name,
                 prompt="",
-                keep_alive=0,       # ← Evict NOW
+                keep_alive=0,
                 stream=False,
             )
             logger.info("Model '%s' evicted from RAM ✓", model_name)
         except Exception as exc:
-            # Non-fatal — model may not have been loaded
             logger.debug("Eviction request for '%s' failed: %s (non-fatal)", model_name, exc)
 
     async def _evict_all_models(self) -> None:
-        """
-        Defensively evict ALL running models before loading a new one.
-
-        Queries Ollama's running model list via the SDK, then evicts
-        each one. Guarantees a clean RAM slate.
-        """
+        """Defensively evict ALL running models before loading a new one."""
+        if self.run_mode == "cloud":
+            return
         try:
-            ps_response = await self.client.ps()
+            ps_response = await self.ollama_client.ps()
             running_models = ps_response.models or []
 
             if not running_models:
@@ -359,26 +447,38 @@ class ChatEngine:
     # -----------------------------------------------------------------------
     async def is_model_available(self) -> bool:
         """
-        Check if the text model is pulled/available in Ollama.
-        Does NOT load the model — just checks the registry.
-        Uses the official SDK `list()` method.
+        Check if the text model is available.
+        - LOCAL: checks Ollama's model registry.
+        - CLOUD: verifies the Llama API connection.
         """
-        try:
-            response = await self.client.list()
-            models = response.models or []
-            model_names = [m.model for m in models if m.model]
-            available = any(self.model_name in name for name in model_names)
+        if self.run_mode == "cloud":
+            if not self.api_key:
+                logger.warning("Cloud mode but no LLAMA_API_KEY set")
+                return False
+            try:
+                models_response = await self.llama_client.models.list()
+                logger.info("Llama API connected ✓ (text model: %s)", self.cloud_model_name)
+                return True
+            except Exception as exc:
+                logger.error("Cannot reach Llama API: %s", exc)
+                return False
+        else:
+            try:
+                response = await self.ollama_client.list()
+                models = response.models or []
+                model_names = [m.model for m in models if m.model]
+                available = any(self.model_name in name for name in model_names)
 
-            if available:
-                logger.info("Text model '%s' is available in Ollama ✓", self.model_name)
-            else:
-                logger.warning(
-                    "Text model '%s' NOT found. Available: %s",
-                    self.model_name,
-                    model_names,
-                )
-            return available
+                if available:
+                    logger.info("Text model '%s' is available in Ollama ✓", self.model_name)
+                else:
+                    logger.warning(
+                        "Text model '%s' NOT found. Available: %s",
+                        self.model_name,
+                        model_names,
+                    )
+                return available
 
-        except Exception as exc:
-            logger.error("Cannot reach Ollama at %s: %s", self.ollama_base_url, exc)
-            return False
+            except Exception as exc:
+                logger.error("Cannot reach Ollama at %s: %s", self.ollama_base_url, exc)
+                return False

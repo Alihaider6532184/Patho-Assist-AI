@@ -9,12 +9,14 @@
    2. CORS configuration for the Next.js frontend
    3. Route registration for PDF ingestion, vision analysis, and chat
    4. Session-level state management (image descriptions per session)
-   5. Ollama model-swap orchestration (16 GB RAM constraint)
+   5. Dual-mode orchestration: LOCAL (Ollama) or CLOUD (Llama API)
 
  Architecture Notes:
-   • Every AI model call goes through a load → infer → unload cycle.
-   • Only ONE model may reside in RAM at any given time.
-   • ChromaDB runs in-process (no external server).
+   • RUNTIME_MODE controls the entire inference pipeline.
+   • LOCAL: Every AI model call goes through load → infer → unload.
+     Only ONE model may reside in RAM at any given time.
+   • CLOUD: Stateless API calls to Meta’s Llama API. No local models required.
+   • ChromaDB always runs in-process (no external server).
    • Vision descriptions are stored in the session alongside the
      per-session ChromaDB collection for true cross-modal context.
 =============================================================================
@@ -45,15 +47,21 @@ from chat_engine import ChatEngine
 # ---------------------------------------------------------------------------
 load_dotenv()  # Reads backend/.env
 
-OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-VISION_MODEL      = os.getenv("VISION_MODEL", "paligemma")
-TEXT_MODEL         = os.getenv("TEXT_MODEL", "gemma2:2b")
-CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
-EMBEDDING_MODEL   = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-MAX_PDF_SIZE_MB   = int(os.getenv("MAX_PDF_SIZE_MB", "50"))
-MAX_IMAGE_SIZE_MB = int(os.getenv("MAX_IMAGE_SIZE_MB", "20"))
-CHUNK_SIZE        = int(os.getenv("CHUNK_SIZE", "1000"))
-CHUNK_OVERLAP     = int(os.getenv("CHUNK_OVERLAP", "200"))
+OLLAMA_BASE_URL     = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+VISION_MODEL        = os.getenv("VISION_MODEL", "llava")
+TEXT_MODEL          = os.getenv("TEXT_MODEL", "gemma2:2b")
+CHROMA_PERSIST_DIR  = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+EMBEDDING_MODEL     = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+MAX_PDF_SIZE_MB     = int(os.getenv("MAX_PDF_SIZE_MB", "50"))
+MAX_IMAGE_SIZE_MB   = int(os.getenv("MAX_IMAGE_SIZE_MB", "20"))
+CHUNK_SIZE          = int(os.getenv("CHUNK_SIZE", "1000"))
+CHUNK_OVERLAP       = int(os.getenv("CHUNK_OVERLAP", "200"))
+
+# --- Dual-Mode Configuration (local vs cloud) ---
+RUNTIME_MODE        = os.getenv("RUNTIME_MODE", "local").lower()
+LLAMA_API_KEY       = os.getenv("LLAMA_API_KEY", "")
+CLOUD_VISION_MODEL  = os.getenv("CLOUD_VISION_MODEL", "Llama-4-Maverick-17B-128E-Instruct-FP8")
+CLOUD_TEXT_MODEL    = os.getenv("CLOUD_TEXT_MODEL", "Llama-3.3-70B-Instruct")
 
 # Upload directory for temporary file storage
 UPLOAD_DIR = Path("./uploads")
@@ -112,11 +120,17 @@ async def lifespan(app: FastAPI):
     global rag_engine, vision_engine, chat_engine
 
     logger.info("=" * 60)
-    logger.info("  Patho-Assist AI  —  Starting Up")
+    logger.info("  Patho-Assist AI — Starting Up")
     logger.info("=" * 60)
-    logger.info("Ollama URL     : %s", OLLAMA_BASE_URL)
-    logger.info("Vision model   : %s", VISION_MODEL)
-    logger.info("Text model     : %s", TEXT_MODEL)
+    logger.info("Runtime mode   : %s", RUNTIME_MODE.upper())
+    if RUNTIME_MODE == "cloud":
+        logger.info("Cloud vision   : %s", CLOUD_VISION_MODEL)
+        logger.info("Cloud text     : %s", CLOUD_TEXT_MODEL)
+        logger.info("API key        : %s", "***" + LLAMA_API_KEY[-4:] if len(LLAMA_API_KEY) > 4 else "NOT SET")
+    else:
+        logger.info("Ollama URL     : %s", OLLAMA_BASE_URL)
+        logger.info("Vision model   : %s", VISION_MODEL)
+        logger.info("Text model     : %s", TEXT_MODEL)
     logger.info("ChromaDB dir   : %s", CHROMA_PERSIST_DIR)
     logger.info("Embedding model: %s", EMBEDDING_MODEL)
 
@@ -129,22 +143,28 @@ async def lifespan(app: FastAPI):
     )
     logger.info("RAG engine initialised ✓")
 
-    # Initialise the Vision engine (no model loaded yet — lazy)
+    # Initialise the Vision engine (dual-mode)
     vision_engine = VisionEngine(
         ollama_base_url=OLLAMA_BASE_URL,
         model_name=VISION_MODEL,
+        run_mode=RUNTIME_MODE,
+        api_key=LLAMA_API_KEY,
+        cloud_model_name=CLOUD_VISION_MODEL,
     )
     logger.info("Vision engine initialised ✓")
 
-    # Initialise the Chat engine (no model loaded yet — lazy)
+    # Initialise the Chat engine (dual-mode)
     chat_engine = ChatEngine(
         ollama_base_url=OLLAMA_BASE_URL,
         model_name=TEXT_MODEL,
+        run_mode=RUNTIME_MODE,
+        api_key=LLAMA_API_KEY,
+        cloud_model_name=CLOUD_TEXT_MODEL,
     )
     logger.info("Chat engine initialised ✓")
 
     logger.info("=" * 60)
-    logger.info("  All systems ready — accepting requests")
+    logger.info("  All systems ready — accepting requests (%s mode)", RUNTIME_MODE.upper())
     logger.info("=" * 60)
 
     yield  # ← Application runs here
@@ -177,6 +197,7 @@ ALLOWED_ORIGINS = [
     "http://localhost:3000",        # Next.js dev server
     "http://127.0.0.1:3000",
     "http://localhost:3001",        # Alternate port
+    "https://*.vercel.app",         # Vercel deployments
 ]
 
 app.add_middleware(
@@ -196,7 +217,8 @@ class HealthResponse(BaseModel):
     """GET /health response."""
     status: str = "ok"
     version: str = "1.0.0"
-    ollama_url: str
+    runtime_mode: str
+    ollama_url: str = ""
     models: dict
     models_available: dict = {}
 
@@ -251,10 +273,11 @@ async def health_check():
     return HealthResponse(
         status="ok",
         version="1.0.0",
-        ollama_url=OLLAMA_BASE_URL,
+        runtime_mode=RUNTIME_MODE,
+        ollama_url=OLLAMA_BASE_URL if RUNTIME_MODE == "local" else "",
         models={
-            "vision": VISION_MODEL,
-            "text": TEXT_MODEL,
+            "vision": CLOUD_VISION_MODEL if RUNTIME_MODE == "cloud" else VISION_MODEL,
+            "text": CLOUD_TEXT_MODEL if RUNTIME_MODE == "cloud" else TEXT_MODEL,
         },
         models_available={
             "vision": vision_available,

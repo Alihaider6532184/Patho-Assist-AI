@@ -37,6 +37,17 @@ To achieve this without out-of-memory (OOM) crashes, the underlying FastAPI back
 
 ---
 
+## ☁️ Hybrid Mode: The Llama API Cloud Integration
+
+While local mode ensures strict data privacy, Patho-Assist AI can be instantly switched to **Cloud Mode** for high-throughput, state-of-the-art inference. This is controlled entirely by the `RUNTIME_MODE` configuration.
+
+When `RUNTIME_MODE="cloud"`, the application bypasses Ollama completely and offloads tasks via the official `llama-api-client` SDK:
+1. **Cloud Vision:** Routes histopathology images (as base64 Data URIs) to Meta's **Llama 4 Maverick (17B)** multimodal model.
+2. **Cloud Reasoning:** Routes the RAG context and visual findings to **Llama 3.3 70B Instruct** for incredibly deep, rapid clinical correlation. 
+
+This hybrid architecture proofs the project for both secure edge-hardware deployments and scalable SaaS (e.g., deploying the frontend to Vercel and pointing it to a cloud-mode backend). 
+
+
 ## 🛠️ Tech Stack
 
 ### Frontend (User Interface)
@@ -89,14 +100,20 @@ npm install
 You must install [Ollama](https://ollama.com/) to serve the models locally. Once Ollama is running in the background, download the specific models used by the system:
 
 ```bash
-# Pull the Histopathology Vision Model (~4.7 GB)
+# Pull the Histopathology Vision Model
 ollama pull llava
 
-# Pull the Cross-Modal Reasoning Text Model (~1.6 GB)
+# Pull the Cross-Modal Reasoning Text Model
 ollama pull gemma2:2b
 ```
 
-*(Note: The embedding model `all-MiniLM-L6-v2` will be downloaded automatically by HuggingFace the first time you run the backend).*
+**Option B: Cloud Mode (High Performance)**
+* Set `RUNTIME_MODE="cloud"`
+* Get an API Key from [Meta Llama Developer Platform](https://llama.developer.meta.com/).
+* Add your key to the `.env` file: `LLAMA_API_KEY="your-key-here"`.
+* *(No local GPU or Ollama installation required).*
+
+*(Note: The embedding model `all-MiniLM-L6-v2` for RAG will always run locally and is downloaded automatically by HuggingFace the first time you run the backend).*
 
 ### 3. Boot the FastAPI Backend
 
